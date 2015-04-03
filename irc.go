@@ -38,7 +38,7 @@ const (
 var ErrDisconnected = errors.New("Disconnect Called")
 
 // Read data from a connection. To be used as a goroutine.
-func (irc *Connection) readLoop() {
+func (irc *Connection) readLoop() error {
 	defer irc.Done()
 	br := bufio.NewReaderSize(irc.socket, 512)
 
@@ -47,7 +47,7 @@ func (irc *Connection) readLoop() {
 	for {
 		select {
 		case <-irc.end:
-			return
+			return nil
 		default:
 			// Set a read deadline based on the combined timeout and ping frequency
 			// We should ALWAYS have received a response from the server within the timeout
@@ -82,7 +82,7 @@ func (irc *Connection) readLoop() {
 					msg = msg[i+1 : len(msg)]
 
 				} else {
-					irc.Log.Printf("Misformed msg from server: %#s\n", msg)
+					return fmt.Errorf("Misformed msg from server: %#s\n", msg)
 				}
 
 				if i, j := strings.Index(event.Source, "!"), strings.Index(event.Source, "@"); i > -1 && j > -1 {
@@ -104,7 +104,7 @@ func (irc *Connection) readLoop() {
 			irc.RunCallbacks(event)
 		}
 	}
-	return
+	return nil
 }
 
 // Loop to write to a connection. To be used as a goroutine.
@@ -173,23 +173,31 @@ func (irc *Connection) pingLoop() {
 }
 
 // Main loop to control the connection.
-func (irc *Connection) Loop() {
-	errChan := irc.ErrorChan()
-	for !irc.stopped {
-		err := <-errChan
-		if irc.stopped {
-			break
-		}
-		irc.Log.Printf("Error, disconnected: %s\n", err)
+func (irc *Connection) Loop() (chan struct{}, chan error) {
+	ech := make(chan error)
+
+	go func(e chan error) {
+		errChan := irc.ErrorChan()
 		for !irc.stopped {
-			if err = irc.Reconnect(); err != nil {
-				irc.Log.Printf("Error while reconnecting: %s\n", err)
-				time.Sleep(1 * time.Second)
-			} else {
+			err := <-errChan
+			ech <- err
+
+			if irc.stopped {
 				break
 			}
+
+			for !irc.stopped {
+				if err = irc.Reconnect(); err != nil {
+					ech <- fmt.Errorf("Error while reconnecting: %s\n", err)
+					time.Sleep(1 * time.Second)
+				} else {
+					break
+				}
+			}
 		}
-	}
+	}(ech)
+
+	return irc.end, ech
 }
 
 // Quit the current connection and disconnect from the server
@@ -369,7 +377,6 @@ func (irc *Connection) Connect(server string) error {
 	if err != nil {
 		return err
 	}
-	irc.Log.Printf("Connected to %s (%s)\n", irc.Server, irc.socket.RemoteAddr())
 
 	irc.pwrite = make(chan string, 10)
 	irc.Error = make(chan error, 2)
